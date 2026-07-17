@@ -1,0 +1,234 @@
+import json
+import os
+import re
+import boto3
+import urllib.request
+from urllib.error import URLError, HTTPError
+from datetime import datetime, timedelta, timezone
+
+# Initialize AWS clients
+secrets_client = boto3.client('secretsmanager')
+ses_client = boto3.client('ses')
+
+# Environment Variables (Set these in AWS Lambda Configuration)
+GITHUB_REPO = os.environ.get('GITHUB_REPO') # Example: 'octocat/Hello-World'
+SES_SENDER_EMAIL = os.environ.get('SES_SENDER_EMAIL')
+SES_RECIPIENT_EMAIL = os.environ.get('SES_RECIPIENT_EMAIL')
+GITHUB_SECRET_NAME = os.environ.get('GITHUB_SECRET_NAME', 'github-token-archvektor-v2')
+GEMINI_SECRET_NAME = os.environ.get('GEMINI_SECRET_NAME', 'gemini-api-key-archvektor-v1')
+GITHUB_BRANCH = os.environ.get('GITHUB_BRANCH', 'main')
+
+def get_secret(secret_id):
+    """Retrieve secret from AWS Secrets Manager."""
+    try:
+        response = secrets_client.get_secret_value(SecretId=secret_id)
+        if 'SecretString' in response:
+            return response['SecretString']
+    except Exception as e:
+        print(f"Error fetching secret {secret_id}: {e}")
+        raise e
+
+def get_recent_commits(token, repo, branch):
+    """Fetch commits from the last 24 hours."""
+    since_date = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    url = f"https://api.github.com/repos/{repo}/commits?since={since_date}&sha={branch}"
+    
+    req = urllib.request.Request(url)
+    req.add_header('Authorization', f'token {token}')
+    req.add_header('Accept', 'application/vnd.github.v3+json')
+    req.add_header('User-Agent', 'ArchVektor-Agent')
+    
+    try:
+        with urllib.request.urlopen(req) as response:
+            commits = json.loads(response.read().decode('utf-8'))
+            return commits
+    except Exception as e:
+        print(f"Error fetching commits: {e}")
+        return []
+
+def get_diff(token, repo, base_sha, head_sha):
+    """Fetch the diff between two commits."""
+    url = f"https://api.github.com/repos/{repo}/compare/{base_sha}...{head_sha}"
+    req = urllib.request.Request(url)
+    req.add_header('Authorization', f'token {token}')
+    req.add_header('Accept', 'application/vnd.github.v3.diff')
+    req.add_header('User-Agent', 'ArchVektor-Agent')
+    
+    try:
+        with urllib.request.urlopen(req) as response:
+            return response.read().decode('utf-8')
+    except HTTPError as e:
+        if e.code == 404:
+            print("Diff not found or comparison too large.")
+        return None
+    except Exception as e:
+        print(f"Error fetching diff: {e}")
+        return None
+
+def invoke_gemini_api(diff_content, api_key):
+    """Invoke Gemini API (Gemini 3.1 Flash Lite) to review the diff."""
+    system_prompt = """You are an AWS Certified Solutions Architect Professional.
+Your task is to review the following Git Diff of infrastructure configurations.
+Evaluate the code for anti-patterns and provide recommendations based on the AWS Well-Architected Framework.
+Your response MUST strictly follow this format:
+- Current State:
+- Recommendations:
+- Pros & Cons:
+- Cost/Time Constraints:
+
+Only provide the review. Be concise, actionable, and use Markdown formatting."""
+    
+    user_message = f"Here is the infrastructure git diff from the last 24 hours:\n\n{diff_content}"
+    
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={api_key}"
+    
+    payload = {
+        "system_instruction": {
+            "parts": {"text": system_prompt}
+        },
+        "contents": [{
+            "parts": [{"text": user_message}]
+        }],
+        "generationConfig": {
+            "temperature": 0.3,
+            "maxOutputTokens": 4000
+        }
+    }
+    
+    data = json.dumps(payload).encode('utf-8')
+    req = urllib.request.Request(url, data=data, method='POST')
+    req.add_header('Content-Type', 'application/json')
+    
+    try:
+        with urllib.request.urlopen(req) as response:
+            response_body = json.loads(response.read().decode('utf-8'))
+            return response_body['candidates'][0]['content']['parts'][0]['text']
+    except Exception as e:
+        print(f"Error invoking Gemini API: {e}")
+        raise e
+
+def send_email_report(review_content):
+    """Send the AI-generated review report via Amazon SES."""
+    
+    html_content = review_content
+    html_content = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', html_content) # Bold
+    html_content = html_content.replace('\n', '<br>') # Line breaks
+    
+    html_body = f"""
+    <html>
+    <head></head>
+    <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+        <h2>ArchVektor: Daily Architecture Review</h2>
+        <p>Please find the automated infrastructure review based on your latest commits:</p>
+        <hr>
+        <div style="background-color: #f9f9f9; padding: 15px; border-radius: 5px;">
+            {html_content}
+        </div>
+        <hr>
+        <p style="font-size: 12px; color: #777;">Generated by Gemini 3.1 Flash Lite - ArchVektor Always-On Agent</p>
+    </body>
+    </html>
+    """
+    
+    try:
+        response = ses_client.send_email(
+            Source=SES_SENDER_EMAIL,
+            Destination={
+                'ToAddresses': [SES_RECIPIENT_EMAIL]
+            },
+            Message={
+                'Subject': {
+                    'Data': 'ArchVektor: Daily AWS Infrastructure Review',
+                    'Charset': 'UTF-8'
+                },
+                'Body': {
+                    'Text': {
+                        'Data': review_content,
+                        'Charset': 'UTF-8'
+                    },
+                    'Html': {
+                        'Data': html_body,
+                        'Charset': 'UTF-8'
+                    }
+                }
+            }
+        )
+        print(f"Email sent successfully! Message ID: {response['MessageId']}")
+    except Exception as e:
+        print(f"Error sending email via SES: {e}")
+        raise e
+
+def lambda_handler(event, context):
+    """Main Lambda Entry Point."""
+    print("ArchVektor Agent Triggered.")
+    
+    if not all([GITHUB_REPO, SES_SENDER_EMAIL, SES_RECIPIENT_EMAIL]):
+        error_msg = "Missing required environment variables (GITHUB_REPO, SES_SENDER_EMAIL, SES_RECIPIENT_EMAIL)."
+        print(error_msg)
+        return {'statusCode': 500, 'body': error_msg}
+    
+    try:
+        # 2. Fetch Secrets
+        github_token = get_secret(GITHUB_SECRET_NAME)
+        gemini_api_key = get_secret(GEMINI_SECRET_NAME)
+        
+        if not github_token or not gemini_api_key:
+            print("Could not retrieve required secrets (GitHub or Gemini).")
+            return {'statusCode': 500, 'body': 'Secrets retrieval error.'}
+            
+        # 3. Fetch Recent Commits
+        commits = get_recent_commits(github_token, GITHUB_REPO, GITHUB_BRANCH)
+        
+        if not commits:
+            print("No new commits in the last 24 hours. Agent goes back to sleep.")
+            return {'statusCode': 200, 'body': 'No new commits. Job skipped.'}
+            
+        print(f"Found {len(commits)} commit(s) in the last 24 hours.")
+        
+        # 4. Determine base and head commit for the diff
+        head_sha = commits[0]['sha'] # Newest commit
+        
+        if len(commits[-1]['parents']) > 0:
+            base_sha = commits[-1]['parents'][0]['sha']
+        else:
+            base_sha = head_sha
+            
+        if base_sha == head_sha:
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/commits/{head_sha}"
+            req = urllib.request.Request(url)
+            req.add_header('Authorization', f'token {github_token}')
+            req.add_header('Accept', 'application/vnd.github.v3.diff')
+            req.add_header('User-Agent', 'ArchVektor-Agent')
+            with urllib.request.urlopen(req) as response:
+                diff_text = response.read().decode('utf-8')
+        else:
+            diff_text = get_diff(github_token, GITHUB_REPO, base_sha, head_sha)
+            
+        if not diff_text or len(diff_text.strip()) == 0:
+            print("No significant file changes found in the diff.")
+            return {'statusCode': 200, 'body': 'No infrastructure changes to review.'}
+            
+        if len(diff_text) > 100000:
+            print("Diff is very large, truncating to fit LLM context limits.")
+            diff_text = diff_text[:100000] + "\n\n...[DIFF TRUNCATED]..."
+            
+        # 5. Invoke Gemini API
+        print("Invoking Gemini 3.1 Flash Lite for Architectural Review...")
+        review = invoke_gemini_api(diff_text, gemini_api_key)
+        
+        # 6. Format Output & Send via Amazon SES
+        print("Sending email report...")
+        send_email_report(review)
+        
+        print("ArchVektor execution completed successfully.")
+        return {
+            'statusCode': 200,
+            'body': json.dumps('Review completed and email sent successfully.')
+        }
+        
+    except Exception as e:
+        print(f"Execution failed: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps('Agent execution failed. Please check AWS CloudWatch Logs.')
+        }
